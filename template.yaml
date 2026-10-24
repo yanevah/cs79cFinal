@@ -1,0 +1,503 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Serverless Journal Archive - S3 + DynamoDB + Lambda + API Gateway + CloudFront.
+  Journals are PDFs named YYYY-Month-1.pdf / YYYY-Month-2.pdf, stored under a folder per year.
+
+Parameters:
+  OwnerName:
+    Type: String
+    Default: "Nina Janev"
+    Description: Shown in tags (and used as evidence in screenshots).
+
+Resources:
+  # ---------------------------------------------------------------
+  # Storage
+  # ---------------------------------------------------------------
+  # Private bucket for the PDFs. Only reachable through pre-signed URLs.
+  JournalBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: IndexLambdaInvokePermission
+    Properties:
+      # Fixed name (built from the stack name) so the Lambda permission and the
+      # bucket notification don't create a circular dependency.
+      # Use a lowercase stack name, e.g. "journal-archive".
+      BucketName: !Sub "${AWS::StackName}-journals-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Function: !GetAtt IndexFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: ".pdf"
+          - Event: "s3:ObjectRemoved:*"
+            Function: !GetAtt IndexFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: ".pdf"
+      Tags:
+        - Key: Owner
+          Value: !Ref OwnerName
+
+  # Private bucket for the website files. Only CloudFront can read it (OAC).
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Owner
+          Value: !Ref OwnerName
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}"
+
+  # ---------------------------------------------------------------
+  # Metadata catalog
+  # ---------------------------------------------------------------
+  # Partition key = year, sort key = "MM-part" (e.g. "03-1") so months sort in order.
+  JournalTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: year
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: year
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Owner
+          Value: !Ref OwnerName
+
+  # ---------------------------------------------------------------
+  # IAM - one least-privilege role per function
+  # ---------------------------------------------------------------
+  ListRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadCatalog
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:Scan
+                Resource: !GetAtt JournalTable.Arn
+
+  DownloadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LookupAndSign
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: !GetAtt JournalTable.Arn
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${AWS::StackName}-journals-${AWS::AccountId}/*"
+
+  IndexRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WriteCatalog
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt JournalTable.Arn
+
+  # ---------------------------------------------------------------
+  # Lambda functions (code is inline so the whole project is one template)
+  # ---------------------------------------------------------------
+  # Event-driven indexer: runs whenever a PDF is added to / removed from S3.
+  IndexFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt IndexRole.Arn
+      Timeout: 15
+      Environment:
+        Variables:
+          TABLE: !Ref JournalTable
+      Tags:
+        - Key: Owner
+          Value: !Ref OwnerName
+      Code:
+        ZipFile: |
+          import os, re, urllib.parse, boto3
+
+          table = boto3.resource("dynamodb").Table(os.environ["TABLE"])
+          PATTERN = re.compile(r"^(\d{4})/(\d{4})-([A-Za-z]+)-([12])\.pdf$", re.IGNORECASE)
+          MONTHS = ["January", "February", "March", "April", "May", "June", "July",
+                    "August", "September", "October", "November", "December"]
+          LOOKUP = {m.lower(): i for i, m in enumerate(MONTHS)}
+          LOOKUP.update({m[:3].lower(): i for i, m in enumerate(MONTHS)})
+
+          def handler(event, context):
+              for rec in event["Records"]:
+                  key = urllib.parse.unquote_plus(rec["s3"]["object"]["key"])
+                  m = PATTERN.match(key)
+                  if not m or m.group(1) != m.group(2) or m.group(3).lower() not in LOOKUP:
+                      print("Skipping unrecognized key:", key)
+                      continue
+                  year, _, month_raw, part = m.groups()
+                  idx = LOOKUP[month_raw.lower()]
+                  keys = {"year": year, "sk": "%02d-%s" % (idx + 1, part)}
+                  if rec["eventName"].startswith("ObjectCreated"):
+                      table.put_item(Item={**keys, "month": MONTHS[idx], "part": part,
+                                           "key": key, "size": rec["s3"]["object"].get("size", 0)})
+                      print("Indexed", key)
+                  else:
+                      table.delete_item(Key=keys)
+                      print("Removed", key)
+
+  IndexLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IndexFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub "arn:aws:s3:::${AWS::StackName}-journals-${AWS::AccountId}"
+
+  # GET /api/journals -> { "1967": { "March": { "1": {sizeMB}, "2": {sizeMB} } } }
+  ListFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ListRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE: !Ref JournalTable
+      Tags:
+        - Key: Owner
+          Value: !Ref OwnerName
+      Code:
+        ZipFile: |
+          import os, json, boto3
+
+          table = boto3.resource("dynamodb").Table(os.environ["TABLE"])
+
+          def handler(event, context):
+              items, kwargs = [], {}
+              while True:
+                  resp = table.scan(**kwargs)
+                  items += resp["Items"]
+                  if "LastEvaluatedKey" not in resp:
+                      break
+                  kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+              out = {}
+              for i in items:
+                  out.setdefault(i["year"], {}).setdefault(i["month"], {})[str(i["part"])] = {
+                      "sizeMB": round(float(i["size"]) / 1048576, 1)}
+              return {"statusCode": 200,
+                      "headers": {"Content-Type": "application/json"},
+                      "body": json.dumps(out)}
+
+  # GET /api/download?year=1967&month=March&part=1 -> { "url": "<pre-signed S3 URL>" }
+  # The client never supplies an S3 key; the key comes from DynamoDB.
+  DownloadFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt DownloadRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE: !Ref JournalTable
+          BUCKET: !Sub "${AWS::StackName}-journals-${AWS::AccountId}"
+      Tags:
+        - Key: Owner
+          Value: !Ref OwnerName
+      Code:
+        ZipFile: |
+          import os, json, boto3
+          from boto3.dynamodb.conditions import Key
+          from botocore.config import Config
+
+          table = boto3.resource("dynamodb").Table(os.environ["TABLE"])
+          REGION = os.environ["AWS_REGION"]
+          s3 = boto3.client("s3", region_name=REGION,
+                            endpoint_url="https://s3.%s.amazonaws.com" % REGION,
+                            config=Config(signature_version="s3v4"))
+
+          def reply(code, body):
+              return {"statusCode": code,
+                      "headers": {"Content-Type": "application/json"},
+                      "body": json.dumps(body)}
+
+          def handler(event, context):
+              q = event.get("queryStringParameters") or {}
+              year, month, part = q.get("year"), q.get("month"), q.get("part")
+              if not (year and month and part):
+                  return reply(400, {"error": "year, month and part are required"})
+              items = table.query(KeyConditionExpression=Key("year").eq(year))["Items"]
+              item = next((i for i in items
+                           if i["month"].lower() == month.lower() and str(i["part"]) == part), None)
+              if not item:
+                  return reply(404, {"error": "Journal not found"})
+              filename = item["key"].split("/")[-1]
+              url = s3.generate_presigned_url(
+                  "get_object",
+                  Params={"Bucket": os.environ["BUCKET"], "Key": item["key"],
+                          "ResponseContentDisposition": 'attachment; filename="%s"' % filename},
+                  ExpiresIn=300)
+              return reply(200, {"url": url, "filename": filename})
+
+  # ---------------------------------------------------------------
+  # API Gateway (HTTP API)
+  # ---------------------------------------------------------------
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      ProtocolType: HTTP
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref Api
+      StageName: "$default"
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+
+  ListIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      PayloadFormatVersion: "2.0"
+      IntegrationUri: !GetAtt ListFunction.Arn
+
+  DownloadIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      PayloadFormatVersion: "2.0"
+      IntegrationUri: !GetAtt DownloadFunction.Arn
+
+  ListRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: "GET /api/journals"
+      Target: !Sub "integrations/${ListIntegration}"
+
+  DownloadRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: "GET /api/download"
+      Target: !Sub "integrations/${DownloadIntegration}"
+
+  ListInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ListFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/GET/api/journals"
+
+  DownloadInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DownloadFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/GET/api/download"
+
+  # ---------------------------------------------------------------
+  # CloudFront: one domain for the site (S3) and the API (/api/*)
+  # ---------------------------------------------------------------
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # Cache and origin-request policies are defined here (instead of using
+  # CloudFront's built-in policy IDs) so the template has no hardcoded IDs.
+  StaticCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub "${AWS::StackName}-static-cache"
+        MinTTL: 0
+        DefaultTTL: 86400
+        MaxTTL: 31536000
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  # Caching fully disabled for the API: pre-signed URLs must never be cached
+  # or shared between visitors.
+  ApiNoCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub "${AWS::StackName}-api-no-cache"
+        MinTTL: 0
+        DefaultTTL: 0
+        MaxTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  # Forward the query string (year/month/part) to API Gateway, but not the
+  # viewer's Host header (API Gateway needs its own host name).
+  ApiOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub "${AWS::StackName}-api-origin-request"
+        CookiesConfig:
+          CookieBehavior: none
+        HeadersConfig:
+          HeaderBehavior: none
+        QueryStringsConfig:
+          QueryStringBehavior: all
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "Journal archive - managed by ${OwnerName}"
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: frontend
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+          - Id: api
+            DomainName: !Sub "${Api}.execute-api.${AWS::Region}.amazonaws.com"
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+        DefaultCacheBehavior:
+          TargetOriginId: frontend
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: !Ref StaticCachePolicy
+        CacheBehaviors:
+          - PathPattern: "/api/*"
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD]
+            CachePolicyId: !Ref ApiNoCachePolicy
+            OriginRequestPolicyId: !Ref ApiOriginRequestPolicy
+      Tags:
+        - Key: Owner
+          Value: !Ref OwnerName
+
+Outputs:
+  SiteURL:
+    Description: Open this in a browser
+    Value: !Sub "https://${Distribution.DomainName}"
+  FrontendBucketName:
+    Description: Upload index.html here
+    Value: !Ref FrontendBucket
+  JournalBucketName:
+    Description: Upload the year folders of PDFs here
+    Value: !Ref JournalBucket
+  DistributionId:
+    Description: Used for cache invalidation after updating the site
+    Value: !Ref Distribution

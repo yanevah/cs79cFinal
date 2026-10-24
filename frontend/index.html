@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Journal Archive</title>
+<style>
+  :root {
+    --bg: #f6f1e7; --paper: #fffdf8; --ink: #2b2620; --muted: #7a6f60;
+    --accent: #8a3b24; --line: #ddd2bd;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font-family: Georgia, "Times New Roman", serif; line-height: 1.5; }
+  header { padding: 2.5rem 1.5rem 1.5rem; text-align: center; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0 0 .25rem; font-size: 2.2rem; letter-spacing: .02em; }
+  header p { margin: 0; color: var(--muted); font-style: italic; }
+  main { max-width: 1050px; margin: 0 auto; padding: 1.5rem; }
+
+  .toolbar { display: flex; gap: .75rem; flex-wrap: wrap; align-items: center; margin-bottom: 1.25rem; }
+  .toolbar input { flex: 1 1 220px; padding: .6rem .8rem; border: 1px solid var(--line);
+                   border-radius: 6px; font: inherit; background: var(--paper); }
+  .count { color: var(--muted); font-size: .9rem; }
+
+  .decade { margin-bottom: 1rem; }
+  .decade h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .12em;
+               color: var(--muted); margin: 0 0 .4rem; }
+  .years { display: flex; flex-wrap: wrap; gap: .4rem; }
+  .year-btn { padding: .35rem .8rem; border: 1px solid var(--line); background: var(--paper);
+              border-radius: 999px; cursor: pointer; font: inherit; color: var(--ink); }
+  .year-btn:hover { border-color: var(--accent); }
+  .year-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  .year-title { display: flex; justify-content: space-between; align-items: baseline;
+                margin: 2rem 0 1rem; border-bottom: 2px solid var(--ink); padding-bottom: .4rem; }
+  .year-title h2 { margin: 0; font-size: 1.8rem; }
+  .year-title span { color: var(--muted); font-size: .9rem; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 1rem; }
+  .card { background: var(--paper); border: 1px solid var(--line); border-radius: 8px; padding: 1rem; }
+  .card.empty { opacity: .45; background: transparent; border-style: dashed; }
+  .card h3 { margin: 0 0 .7rem; font-size: 1.15rem; }
+  .parts { display: flex; gap: .5rem; }
+  .part { flex: 1; text-align: center; padding: .5rem .3rem; border-radius: 6px;
+          font: inherit; font-size: .9rem; border: 1px solid var(--accent);
+          color: var(--accent); background: transparent; cursor: pointer; }
+  button.part:hover { background: var(--accent); color: #fff; }
+  button.part:disabled { opacity: .6; cursor: wait; }
+  .part small { display: block; color: inherit; opacity: .7; font-size: .72rem; }
+  .part.missing { border-color: var(--line); color: var(--muted); border-style: dashed; cursor: default; }
+  .none, .error { text-align: center; color: var(--muted); padding: 3rem 0; }
+  .error { color: #a02020; }
+  footer { text-align: center; color: var(--muted); font-size: .85rem; padding: 2rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Journal Archive</h1>
+  <p>Browse by year. Each month is published in two parts.</p>
+</header>
+
+<main>
+  <div class="toolbar">
+    <input id="search" type="search" placeholder="Jump to a year or month (e.g. 1992, June)">
+    <span class="count" id="count"></span>
+  </div>
+  <div id="decades"></div>
+  <div id="view"><div class="none">Loading journals…</div></div>
+</main>
+
+
+<footer>Managed by Nina Janev · Click Part 1 or Part 2 to download the PDF.</footer>
+
+<script>
+const MONTHS = ["January","February","March","April","May","June","July",
+                "August","September","October","November","December"];
+let JOURNALS = {};
+let years = [];
+let current = null;
+
+const $ = id => document.getElementById(id);
+
+async function load() {
+  try {
+    const res = await fetch("/api/journals");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    JOURNALS = await res.json();
+    years = Object.keys(JOURNALS).sort();
+    current = years[0] || null;
+    const total = years.reduce((n, y) => n + Object.values(JOURNALS[y])
+      .reduce((m, p) => m + Object.keys(p).length, 0), 0);
+    $("count").textContent = `${total} journals · ${years.length} years`;
+    renderYearPicker();
+    renderYear();
+  } catch (err) {
+    $("view").innerHTML = `<div class="error">Couldn't load the journal list (${err.message}).</div>`;
+  }
+}
+
+function renderYearPicker(filter = "") {
+  const f = filter.trim().toLowerCase();
+  const visible = years.filter(y => !f || y.includes(f));
+  const byDecade = {};
+  visible.forEach(y => (byDecade[y.slice(0, 3) + "0s"] ||= []).push(y));
+  $("decades").innerHTML = Object.entries(byDecade).map(([dec, ys]) => `
+    <div class="decade">
+      <h2>${dec}</h2>
+      <div class="years">${ys.map(y =>
+        `<button class="year-btn ${y === current ? "active" : ""}" data-year="${y}">${y}</button>`
+      ).join("")}</div>
+    </div>`).join("") || `<div class="none">No years match.</div>`;
+  document.querySelectorAll(".year-btn").forEach(b =>
+    b.onclick = () => { current = b.dataset.year; renderYearPicker($("search").value); renderYear(); });
+}
+
+function partButton(entry, month, n) {
+  if (!entry) return `<span class="part missing">Part ${n}<small>not available</small></span>`;
+  return `<button class="part" data-year="${current}" data-month="${month}" data-part="${n}">
+            Part ${n}<small>PDF · ${entry.sizeMB} MB</small></button>`;
+}
+
+function renderYear(monthFilter = "") {
+  if (!current || !JOURNALS[current]) {
+    if (!years.length) $("view").innerHTML = `<div class="none">No journals uploaded yet.</div>`;
+    return;
+  }
+  const data = JOURNALS[current];
+  const mf = monthFilter.toLowerCase();
+  const shown = MONTHS.filter(m => !mf || m.toLowerCase().includes(mf));
+  $("view").innerHTML = `
+    <div class="year-title"><h2>${current}</h2><span>${Object.keys(data).length} of 12 months available</span></div>
+    <div class="grid">${shown.map(m => {
+      const p = data[m];
+      return `<div class="card ${p ? "" : "empty"}">
+        <h3>${m}</h3>
+        <div class="parts">${partButton(p && p["1"], m, 1)}${partButton(p && p["2"], m, 2)}</div>
+      </div>`;
+    }).join("")}</div>`;
+  document.querySelectorAll("button.part").forEach(b => b.onclick = () => download(b));
+}
+
+// Ask the API for a short-lived pre-signed URL, then let the browser download straight from S3.
+async function download(btn) {
+  const { year, month, part } = btn.dataset;
+  btn.disabled = true;
+  try {
+    const res = await fetch(`/api/download?year=${year}&month=${month}&part=${part}`);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const { url } = await res.json();
+    window.location.href = url;
+  } catch (err) {
+    alert("Sorry, the download failed: " + err.message);
+  } finally {
+    setTimeout(() => { btn.disabled = false; }, 1500);
+  }
+}
+
+$("search").addEventListener("input", e => {
+  const q = e.target.value.trim();
+  const yearMatch = q.match(/\d{4}/);
+  const monthText = q.replace(/\d{4}/, "").trim();
+  if (yearMatch && JOURNALS[yearMatch[0]]) current = yearMatch[0];
+  renderYearPicker(yearMatch ? yearMatch[0] : (monthText ? "" : q));
+  renderYear(monthText);
+});
+
+load();
+</script>
+</body>
+</html>
