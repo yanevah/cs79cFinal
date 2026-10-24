@@ -15,25 +15,6 @@ A serverless portal for browsing and downloading an archive of PDF journals (one
 
 ![Architecture diagram](docs/finaldiagram.drawio.png)
 
-<details>
-<summary>Text version of the diagram (Mermaid)</summary>
-
-```mermaid
-flowchart LR
-    U[Visitor browser] -->|HTTPS| CF[CloudFront]
-    CF -->|"/ (static site)"| FE[(S3: frontend bucket)]
-    CF -->|"/api/*"| APIGW[API Gateway HTTP API]
-    APIGW --> L1[Lambda: list journals]
-    APIGW --> L2["Lambda: download link<br/>(signs a 5-min URL locally,<br/>no call to S3)"]
-    L1 -->|Scan| DDB[(DynamoDB: journal catalog)]
-    L2 -->|Query| DDB
-    U -.->|"download straight from S3<br/>via the pre-signed URL"| PDF[(S3: PDF bucket)]
-    ADMIN[Admin: upload PDFs] -->|upload PDF| PDF
-    PDF -->|ObjectCreated / ObjectRemoved| L3[Lambda: indexer]
-    L3 -->|PutItem / DeleteItem| DDB
-```
-
-</details>
 
 ### How a request flows
 1. **Browse:** the browser loads the site from CloudFront (S3 origin), then calls `/api/journals`. A Lambda scans DynamoDB and returns year, month and part.
